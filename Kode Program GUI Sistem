@@ -1,0 +1,231 @@
+import tkinter as tk
+from tkinter import messagebox
+import pyaudio
+import wave
+import threading
+import time
+import os
+import librosa
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tensorflow as tf
+import pygame
+from datetime import datetime
+
+# Initialize pygame mixer
+pygame.mixer.init()
+
+# Load the trained model
+model = tf.keras.models.load_model(r'C:\Users\Asus\Model\lung_sound_with_formants.h5')
+
+# Fungsi untuk normalisasi menggunakan nilai puncak (peak value)
+def peak_normalize(y):
+    peak = np.max(np.abs(y))
+    y_normalized = y / peak if peak != 0 else y
+    return y
+
+# Fungsi untuk filtering menggunakan Butterworth band-pass filter
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    y = filtfilt(b, a, data)
+    return y
+
+# Fungsi ekstraksi formant
+def extract_formants(y, sr):
+    formants = []
+    try:
+        # Extract the fundamental frequency and harmonics
+        f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=75, fmax=300, sr=sr)
+        f0 = f0[~np.isnan(f0)]
+        if len(f0) > 0:
+            # Take mean of fundamental frequency as formant feature
+            formants.append(np.mean(f0))
+        else:
+            formants.append(0)
+    except Exception as e:
+        print(f"Error extracting formants: {e}")
+        formants.append(0)
+    return formants
+
+# Fungsi untuk memuat dan memproses file audio serta ekstraksi fitur MFCC dan formant
+def preprocess_audio(audio_path, duration=10, sr=22050):
+    input_length = sr * duration
+    try:
+        X, sr = librosa.load(audio_path, sr=sr, duration=duration, res_type='kaiser_fast')
+        dur = librosa.get_duration(y=X, sr=sr)
+        if round(dur) < duration:
+            X = librosa.util.fix_length(X, input_length)
+        # Normalisasi dengan nilai puncak
+        X = peak_normalize(X)
+        # Filtering dengan band-pass filter
+        X = butter_bandpass_filter(X, lowcut=250, highcut=2000, fs=sr, order=5)
+        # Ekstraksi fitur MFCC dari data
+        mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sr, n_mfcc=25).T, axis=0)
+        # Ekstraksi formant dari data
+        formants = extract_formants(X, sr)
+        # Menggabungkan MFCCs dan formants
+        features = np.concatenate((mfccs, formants), axis=None)
+    except Exception as e:
+        print(f"Error encountered while parsing file: {audio_path}: {e}")
+        features = np.zeros(26)  # 25 MFCCs + 1 formant
+    return features
+# Ensure the audio record directory exists
+AUDIO_RECORD_PATH = "D:\\AUDIO_RECORD"
+if not os.path.exists(AUDIO_RECORD_PATH):
+    os.makedirs(AUDIO_RECORD_PATH)
+
+# GUI class
+class LungSoundApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistem Deteksi Penyakit Pernafasan")
+        self.root.geometry("800x480")  # Set the size to match the LCD screen resolution
+
+        self.main_frame = tk.Frame(root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.left_frame = tk.Frame(self.main_frame)
+        self.left_frame.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.center_frame = tk.Frame(self.main_frame)
+        self.center_frame.pack(side=tk.LEFT, padx=5, pady=5, expand=True)
+
+        self.right_frame = tk.Frame(self.main_frame)
+        self.right_frame.pack(side=tk.RIGHT, padx=5, pady=5)
+
+        self.label = tk.Label(self.center_frame, text="Sistem Deteksi Penyakit Pernafasan", font=("Helvetica", 16))
+        self.label.pack(pady=10)
+
+        button_width = 20  # Set a fixed width for buttons
+        button_height = 2  # Set a fixed height for buttons
+        font_size = 12  # Set a consistent font size for all buttons
+
+        self.record_button = tk.Button(self.right_frame, text="Mulai Rekam", command=self.start_recording, font=("Helvetica", font_size), width=button_width, height=button_height)
+        self.record_button.pack(pady=5)
+
+        self.result_button = tk.Button(self.right_frame, text="Tampilkan Hasil", command=self.show_result, font=("Helvetica", font_size), width=button_width, height=button_height)
+        self.result_button.pack(pady=5)
+        self.result_button.config(state="disabled")
+
+        self.play_button = tk.Button(self.right_frame, text="Putar Audio Record", command=self.play_recorded_audio, font=("Helvetica", font_size), width=button_width, height=button_height)
+        self.play_button.pack(pady=5)
+        self.play_button.config(state="disabled")
+
+        self.reset_button = tk.Button(self.right_frame, text="Reset", command=self.reset_program, font=("Helvetica", font_size), width=button_width, height=button_height)
+        self.reset_button.pack(pady=5)
+
+        self.audio_path = None  # Will be set when recording starts
+        self.is_recording = False
+        self.canvas = None  # Canvas to hold waveform plot
+
+    def start_recording(self):
+        self.record_button.config(state="disabled")
+        self.countdown_label = tk.Label(self.center_frame, text="Perekaman dimulai dalam 3", font=("Helvetica", 14))
+        self.countdown_label.pack(pady=10)
+        self.root.update()
+        for i in range(3, 0, -1):
+            time.sleep(1)
+            self.countdown_label.config(text=f"Perekaman dimulai dalam {i}")
+            self.root.update()
+        self.countdown_label.config(text="Perekaman suara pernafasan...")
+        self.root.update()
+
+        # Create unique filename using timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.audio_path = os.path.join(AUDIO_RECORD_PATH, f"recorded_audio_{timestamp}.wav")
+
+        self.is_recording = True
+        threading.Thread(target=self.record_audio, args=(15,)).start()
+
+    def record_audio(self, duration):
+        try:
+            CHUNK = 1024
+            FORMAT = pyaudio.paInt16
+            CHANNELS = 1
+            RATE = 44100
+            WAVE_OUTPUT_FILENAME = self.audio_path
+
+            p = pyaudio.PyAudio()
+            stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+            frames = []
+
+            for _ in range(0, int(RATE / CHUNK * duration)):
+                if not self.is_recording:
+                    break
+                data = stream.read(CHUNK)
+                frames.append(data)
+
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+
+            with wave.open(WAVE_OUTPUT_FILENAME, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(p.get_sample_size(FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(b''.join(frames))
+
+            self.is_recording = False
+            self.countdown_label.config(text="Rekaman suara Anda berhasil!")
+            self.result_button.config(state="normal")
+            self.play_button.config(state="normal")
+            self.show_waveform()
+        except Exception as e:
+            print(f"Error during recording: {e}")
+            self.countdown_label.config(text="Error during recording. Please try again.")
+            self.record_button.config(state="normal")
+
+    def show_waveform(self):
+        # Clear previous canvas if exists
+        if self.canvas:
+            self.canvas.get_tk_widget().destroy()
+
+        fig, ax = plt.subplots(figsize=(5, 2))
+        data, sample_rate = librosa.load(self.audio_path)
+        librosa.display.waveshow(data, sr=sample_rate, ax=ax)
+        ax.set_title('Waveform')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Amplitude')
+        self.canvas = FigureCanvasTkAgg(fig, master=self.center_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(pady=10)
+
+    def play_recorded_audio(self):
+        pygame.mixer.music.load(self.audio_path)
+        pygame.mixer.music.play()
+
+    def show_result(self):
+        try:
+            features = preprocess_audio(self.audio_path)
+            features = np.expand_dims(features, axis=0)
+            prediction = model.predict(features)
+            predicted_class = np.argmax(prediction, axis=1)
+            classes = ["Normal", "Asthma", "Bronkitis", "Pneumonia"]
+            result = classes[predicted_class[0]]
+            messagebox.showinfo("Hasil Prediksi", f"Prediksi Penyakit Pernafasan Anda Adalah: {result}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error during prediction: {e}")
+
+    def reset_program(self):
+        # Clear previous canvas if exists
+        if self.canvas:
+            self.canvas.get_tk_widget().destroy()
+
+        # Reset GUI to initial state
+        self.record_button.config(state="normal")
+        self.result_button.config(state="disabled")
+        self.play_button.config(state="disabled")
+        if hasattr(self, 'countdown_label'):
+            self.countdown_label.destroy()
+        self.countdown_label = None
+        self.is_recording = False
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = LungSoundApp(root)
+    root.mainloop()
